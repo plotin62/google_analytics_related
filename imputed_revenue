@@ -1,0 +1,455 @@
+# google_analytics_related
+#!/bin/bash
+
+source "$( dirname $0 )/upload_metric.sh"
+source "$( dirname $0 )/util.sh"
+set -x
+
+function cell () {
+  local row="$1"
+  local col="$2"
+  grep "$row" | awk "{ print \$$col; }"
+}
+
+function imputed_revenue () {
+
+  local date="${1:-$( days_from_now 0 )}"
+  local wdate="$( days_from_date $date 365 )"
+  local channel="$2"
+  local n_days=365
+  local prevdate=$(date --date="${wdate} 1 month ago" +"%Y-%m-%d")
+  local path="/cns/ig-d/home/aredakov/imputed_revenue_${wdate}_${channel}"
+  local svg="$( tempfile --prefix ${channel}__ --suffix .svg )"
+
+  tee /dev/stderr << EOF | dremel
+  ${DREMEL_INIT}
+
+  # Newly linked CIDs.
+  MATERIALIZE '${path}/within_month_linked_cids/data@1' AS
+  SELECT l_customer_id AS customer_id
+  FROM
+    (SELECT cs.tuo_by_cid.data.adwords_link_data.serving_account.internal_cid
+      AS l_customer_id
+    FROM analytics_config_management_placer.adwords_links
+    WHERE STRFTIME_USEC(run_timestamp,'%Y-%m-%d') = '${wdate}'
+    GROUP@50 BY 1) l
+  LEFT JOIN@50
+    (SELECT cs.tuo_by_cid.data.adwords_link_data.serving_account.internal_cid
+      AS e_customer_id
+    FROM analytics_config_management_placer.adwords_links
+    WHERE STRFTIME_USEC(run_timestamp,'%Y-%m-%d') = '${prevdate}'
+    GROUP@50 BY 1) e
+  ON l_customer_id = e_customer_id
+  WHERE e_customer_id IS NULL
+  GROUP@50 BY 1;
+
+  # Treatment: Before.
+  DEFINE TABLE within_month_linked_cids ${path}/within_month_linked_cids/data*;
+  DEFINE TABLE mean_max_test ${path}/mean_max_test/data*;
+  MATERIALIZE '${path}/spend_before_linkage/data@1' AS
+  SELECT r.customer_id AS customer_id, (spend_before/dates_billed) AS treat_daily_before
+  FROM
+    (SELECT
+      INT64(uaid_source_account_id_string) AS customer_id,
+      COUNT(DISTINCT date_id) AS dates_billed,
+      SUM(delivered_revenue.revenue_usd_quarterly_fx) AS spend_before
+    FROM XP_DailyCurrentStats_F x
+    WHERE billing_category = 'Billable'
+      AND uaid_source_system = 'ADWORDS'
+      AND service_channel = '${channel}'
+      AND date_id > INT64(FLOOR((DATE_ADD('${prevdate}', -${n_days}, "DAY")
+      - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+      AND date_id <= INT64(FLOOR((DATE_ADD('${prevdate}', 1, "DAY")
+      - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+      AND delivered_revenue.revenue_usd_quarterly_fx > 0
+    GROUP@50 BY 1) r
+  JOIN@50 within_month_linked_cids s
+  ON r.customer_id = s.customer_id;
+
+  # Treatment: After.
+  MATERIALIZE '${path}/spend_after_linkage/data@1' AS
+  SELECT r.customer_id AS customer_id, (spend_after/dates_billed) AS treat_daily_after
+  FROM
+    (SELECT
+      INT64(uaid_source_account_id_string) AS customer_id,
+      COUNT(DISTINCT date_id) AS dates_billed,
+      SUM(delivered_revenue.revenue_usd_quarterly_fx) AS spend_after
+    FROM XP_DailyCurrentStats_F x
+    WHERE billing_category = 'Billable'
+      AND uaid_source_system = 'ADWORDS'
+      AND service_channel = '${channel}'
+      AND date_id >= INT64(FLOOR((DATE_ADD('${wdate}', 1, "DAY")
+      - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+      AND date_id <= INT64(FLOOR((DATE_ADD('${wdate}', +${n_days}, "DAY")
+      - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+      AND delivered_revenue.revenue_usd_quarterly_fx > 0
+    GROUP@50 BY 1) r
+  JOIN@50 within_month_linked_cids s
+  ON r.customer_id = s.customer_id;
+
+  # Mean spend before.
+  MATERIALIZE '${path}/mean_before/data@1' AS
+  SELECT AVG(treat_daily_before) AS mean_before
+  FROM
+  (SELECT r.customer_id AS customer_id, (spend_before/dates_billed) AS treat_daily_before
+  FROM
+    (SELECT
+      INT64(uaid_source_account_id_string) AS customer_id,
+      COUNT(DISTINCT date_id) AS dates_billed,
+      SUM(delivered_revenue.revenue_usd_quarterly_fx) AS spend_before
+    FROM XP_DailyCurrentStats_F x
+    WHERE billing_category = 'Billable'
+      AND uaid_source_system = 'ADWORDS'
+      AND service_channel = '${channel}'
+      AND date_id > INT64(FLOOR((DATE_ADD('${prevdate}', -${n_days}, "DAY")
+      - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+      AND date_id <= INT64(FLOOR((DATE_ADD('${prevdate}', 1, "DAY")
+      - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+      AND delivered_revenue.revenue_usd_quarterly_fx > 0
+    GROUP@50 BY 1) r
+  JOIN@50 within_month_linked_cids s
+  ON r.customer_id = s.customer_id);
+
+  # Treatment:Growth dynamic.
+  MATERIALIZE '${path}/spend_before_yearago/data@1' AS
+  SELECT r.customer_id AS customer_id, spend_before_yearago
+  FROM
+    (SELECT
+    INT64(uaid_source_account_id_string) AS customer_id,
+    SUM(delivered_revenue.revenue_usd_quarterly_fx) AS spend_before_yearago
+   FROM XP_DailyCurrentStats_F x
+  WHERE billing_category = 'Billable'
+    AND uaid_source_system = 'ADWORDS'
+    AND service_channel = '${channel}'
+    AND date_id > INT64(FLOOR((DATE_ADD('${prevdate}', -365, "DAY")
+    - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+    AND date_id <= INT64(FLOOR((DATE_ADD('${prevdate}',-335, "DAY")
+    - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+    AND delivered_revenue.revenue_usd_quarterly_fx > 0
+  GROUP@50 BY 1) r
+  JOIN@50 within_month_linked_cids s
+  ON r.customer_id = s.customer_id;
+
+  MATERIALIZE '${path}/spend_before_monthago/data@1' AS
+  SELECT r.customer_id AS customer_id, spend_before_monthago
+  FROM
+    (SELECT INT64(uaid_source_account_id_string) AS customer_id,
+    SUM(delivered_revenue.revenue_usd_quarterly_fx) AS spend_before_monthago
+  FROM XP_DailyCurrentStats_F x
+  WHERE billing_category = 'Billable'
+  AND uaid_source_system = 'ADWORDS'
+  AND service_channel = '${channel}'
+  AND date_id > INT64(FLOOR((DATE_ADD('${prevdate}', -30, "DAY")
+    - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+  AND date_id <= INT64(FLOOR((DATE_ADD('${prevdate}', 1, "DAY")
+    - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+  AND delivered_revenue.revenue_usd_quarterly_fx > 0
+  GROUP@50 BY 1) r
+  JOIN@50 within_month_linked_cids s
+  ON r.customer_id = s.customer_id;
+
+  # N of all linked CIDs with revenue for last year.
+  MATERIALIZE '${path}/n_of_linked_cids/data@1' AS
+  SELECT COUNT(DISTINCT r.customer_id) AS n_cid
+  FROM
+    (SELECT INT64(uaid_source_account_id_string) AS customer_id
+    FROM XP_DailyCurrentStats_F x
+    WHERE billing_category = 'Billable'
+      AND uaid_source_system = 'ADWORDS'
+      AND service_channel = '${channel}'
+      AND date_id >= INT64(FLOOR((DATE_ADD('${wdate}', 1, "DAY")
+      - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+      AND date_id <= INT64(FLOOR((DATE_ADD('${wdate}', +${n_days}, "DAY")
+      - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+      AND delivered_revenue.revenue_usd_quarterly_fx > 0
+    GROUP@50 BY 1) r
+  JOIN@50
+    (SELECT data.serving_account.adwords_internal_customer_id AS customer_id
+    FROM FLATTEN(FLATTEN(analytics_configstore.prod.AdwordsLinks,
+      data.serving_account.adwords_internal_customer_id),
+      participation.enabled_view_id)
+    WHERE participation.enabled_view_id > 0) c
+  ON r.customer_id = c.customer_id;
+
+ # Treatment.
+  DEFINE TABLE before ${path}/spend_before_linkage/data*;
+  DEFINE TABLE after ${path}/spend_after_linkage/data*;
+  DEFINE TABLE spend_before_yearago ${path}/spend_before_yearago/data*;
+  DEFINE TABLE spend_before_monthago ${path}/spend_before_monthago/data*;
+  MATERIALIZE '${path}/revenue_afterbefore_linkage/data@1' AS
+  SELECT prs.customer_id AS customer_id, treat_daily_after, treat_daily_before,
+    country, vertical, spend_before_yearago, spend_before_monthago
+  FROM
+  (SELECT pr.customer_id AS customer_id, treat_daily_after, treat_daily_before,
+    country,vertical, spend_before_yearago
+  FROM
+  (SELECT p.customer_id AS customer_id, treat_daily_after,
+    treat_daily_before, service_country_code AS country,
+    vertical_inferred AS vertical
+  FROM Perf_Accounts_D_Dev p
+  JOIN@50
+    (SELECT a.customer_id AS customer_id,treat_daily_after, treat_daily_before
+    FROM after a
+    JOIN@50 before b
+    ON a.customer_id = b.customer_id) r
+  ON p.customer_id = r.customer_id) pr
+  JOIN@50 spend_before_yearago s
+  ON pr.customer_id = s.customer_id) prs
+  JOIN@50 spend_before_monthago m
+  ON prs.customer_id = m.customer_id;
+
+  # All linked CIDs: To get never linked ones.
+  MATERIALIZE '${path}/all_linked_cids/data@1' AS
+  SELECT data.adwords_link_data.serving_account.adwords_internal_customer_id
+    AS customer_id
+  FROM FLATTEN(FLATTEN(configstore_prod.TrackingUnitObjects,
+    data.adwords_link_data.serving_account.adwords_internal_customer_id),
+    internalData.participation.enabled_view_id)
+  WHERE objectType = 'adwords_link'
+    AND internalData.participation.enabled_view_id > 0
+  GROUP@50 BY 1;
+
+  # Control:Before.
+  DEFINE TABLE all_linked_cids ${path}/all_linked_cids/data*;
+  MATERIALIZE '${path}/control_spend_before_linkage/data@1' AS
+  SELECT r.customer_id AS customer_id, (spend_before/dates_billed) AS control_daily_before
+  FROM
+    (SELECT
+      INT64(uaid_source_account_id_string) AS customer_id,
+      COUNT(DISTINCT date_id) AS dates_billed,
+      SUM(delivered_revenue.revenue_usd_quarterly_fx) AS spend_before
+    FROM XP_DailyCurrentStats_F x
+    WHERE billing_category = 'Billable'
+      AND uaid_source_system = 'ADWORDS'
+      AND service_channel = '${channel}'
+      AND date_id > INT64(FLOOR((DATE_ADD('${prevdate}', -${n_days}, "DAY")
+      - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+      AND date_id <= INT64(FLOOR((DATE_ADD('${prevdate}', 1, "DAY")
+      - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+      AND delivered_revenue.revenue_usd_quarterly_fx > 0
+    GROUP@50 BY 1) r
+  LEFT JOIN@50 all_linked_cids linked
+  ON r.customer_id = linked.customer_id
+  WHERE linked.customer_id IS NULL;
+
+  # Control:After.
+  MATERIALIZE '${path}/control_spend_after_linkage/data@1' AS
+  SELECT r.customer_id AS customer_id, (spend_after/dates_billed) AS control_daily_after
+  FROM
+    (SELECT
+      INT64(uaid_source_account_id_string) AS customer_id,
+      COUNT(DISTINCT date_id) AS dates_billed,
+      SUM(delivered_revenue.revenue_usd_quarterly_fx) AS spend_after
+    FROM XP_DailyCurrentStats_F x
+    WHERE billing_category = 'Billable'
+      AND uaid_source_system = 'ADWORDS'
+      AND service_channel = '${channel}'
+      AND date_id >= INT64(FLOOR((DATE_ADD('${wdate}', 1, "DAY")
+      - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+       AND date_id <= INT64(FLOOR((DATE_ADD('${wdate}', +${n_days}, "DAY")
+      - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+      AND delivered_revenue.revenue_usd_quarterly_fx > 0
+    GROUP@50 BY 1) r
+  LEFT JOIN@50 all_linked_cids linked
+  ON r.customer_id = linked.customer_id
+  WHERE linked.customer_id IS NULL;
+
+  # Control:Growth dynamic.
+  MATERIALIZE '${path}/control_spend_before_yearago/data@1' AS
+  SELECT r.customer_id AS customer_id, spend_before_yearago
+  FROM
+    (SELECT
+    INT64(uaid_source_account_id_string) AS customer_id,
+    SUM(delivered_revenue.revenue_usd_quarterly_fx) AS spend_before_yearago,
+   FROM XP_DailyCurrentStats_F x
+  WHERE billing_category = 'Billable'
+    AND uaid_source_system = 'ADWORDS'
+    AND service_channel = '${channel}'
+    AND date_id > INT64(FLOOR((DATE_ADD('${prevdate}', -365, "DAY")
+    - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+    AND date_id <= INT64(FLOOR((DATE_ADD('${prevdate}',-335, "DAY")
+    - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+    AND delivered_revenue.revenue_usd_quarterly_fx > 0
+  GROUP@50 BY 1) r
+  LEFT JOIN@50 all_linked_cids linked
+  ON r.customer_id = linked.customer_id
+  WHERE linked.customer_id IS NULL;
+
+  MATERIALIZE '${path}/conrol_spend_before_monthago/data@1' AS
+  SELECT r.customer_id AS customer_id, spend_before_monthago
+  FROM
+  (SELECT INT64(uaid_source_account_id_string) AS customer_id,
+    SUM(delivered_revenue.revenue_usd_quarterly_fx) AS spend_before_monthago,
+  FROM XP_DailyCurrentStats_F x
+  WHERE billing_category = 'Billable'
+  AND uaid_source_system = 'ADWORDS'
+  AND service_channel = '${channel}'
+  AND date_id > INT64(FLOOR((DATE_ADD('${prevdate}', -30, "DAY")
+    - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+  AND date_id <= INT64(FLOOR((DATE_ADD('${prevdate}', 1, "DAY")
+    - parse_time_usec('2000-01-01')) / 3600 / 24/ 1000000))
+  AND delivered_revenue.revenue_usd_quarterly_fx > 0
+  GROUP@50 BY 1) r
+  LEFT JOIN@50 all_linked_cids linked
+  ON r.customer_id = linked.customer_id
+  WHERE linked.customer_id IS NULL;
+
+  DEFINE TABLE control_before ${path}/control_spend_before_linkage/data*;
+  DEFINE TABLE control_after ${path}/control_spend_after_linkage/data*;
+  DEFINE TABLE conrol_spend_before_monthago ${path}/conrol_spend_before_monthago/data*;
+  DEFINE TABLE control_spend_before_yearago ${path}/control_spend_before_yearago/data*;
+  MATERIALIZE '${path}/control_revenue/data@1' AS
+  SELECT mpr.customer_id AS customer_id, control_daily_after, control_daily_before,
+    country, vertical, spend_before_monthago, spend_before_yearago
+  FROM
+  (SELECT pr.customer_id AS customer_id, control_daily_after, control_daily_before,
+    country, vertical, spend_before_monthago
+  FROM
+  (SELECT p.customer_id AS customer_id, control_daily_after,
+    control_daily_before, service_country_code AS country,
+    vertical_inferred AS vertical
+  FROM Perf_Accounts_D_Dev p
+  JOIN@50
+    (SELECT a.customer_id AS customer_id,control_daily_after,control_daily_before
+    FROM control_after a
+    JOIN@50 control_before b
+    ON a.customer_id = b.customer_id) r
+  ON p.customer_id = r.customer_id) pr
+  JOIN@50 conrol_spend_before_monthago m
+  ON pr.customer_id = m.customer_id) mpr
+  JOIN@50 control_spend_before_yearago y
+  ON mpr.customer_id = y.customer_id;
+
+EOF
+
+  R --vanilla << EOF
+  library(ginstall)
+  library(gfile)
+  library(namespacefs)
+  library(rglib)
+  library(cfs)
+  library(dremel)
+  library(gbm)
+  InitGoogle()
+  options("scipen"=100, "digits"=6)
+
+  myConn <- DremelConnect()
+  DremelSetMinCompletionRatio(myConn, 1.0)
+  DremelSetAccountingGroup(myConn,'urchin-processing-qa')
+  DremelSetMaterializeOwnerGroup(myConn, 'materialize-a-dremel')
+  DremelSetMaterializeOverwrite(myConn, TRUE)
+  DremelSetIOTimeout(myConn, 7200)
+
+  # Treatment.
+  DremelAddTableDef('afterbefore_linkage', '${path}/revenue_afterbefore_linkage/data*', myConn, verbose=FALSE)
+  d <- DremelExecuteQuery("
+    SELECT
+      ROUND(treat_daily_before,2) AS daily_before,
+      ROUND(treat_daily_after-treat_daily_before,2) AS diff,
+      ROUND((spend_before_monthago/spend_before_yearago)-1,2) AS dynamic,
+      ROUND((treat_daily_after-treat_daily_before)/treat_daily_before,2) AS diff_percent,
+      1 AS treat, country, vertical
+    FROM afterbefore_linkage
+    HAVING diff_percent <= 2
+  ;", myConn)
+
+  # Control.
+  DremelAddTableDef('control', '${path}/control_revenue/data*', myConn, verbose=FALSE)
+  c <- DremelExecuteQuery("
+    SELECT
+      ROUND(control_daily_before,2) AS daily_before,
+      ROUND(control_daily_after-control_daily_before,2) AS diff,
+      ROUND((spend_before_monthago/spend_before_yearago)-1,2) AS dynamic,
+      ROUND((control_daily_after-control_daily_before)/control_daily_before,2) AS diff_percent,
+      0 AS treat, country, vertical,
+    FROM control
+    HAVING diff_percent <= 2
+  ;", myConn)
+
+  DremelAddTableDef('mean_before', '${path}/mean_before/data*', myConn, verbose=FALSE)
+  mean_before <- DremelExecuteQuery("SELECT mean_before FROM mean_before;", myConn)
+  mean_before <- mean_before\$mean_before
+
+  DremelAddTableDef('n_of_linked_cids', '${path}/n_of_linked_cids/data*', myConn, verbose=FALSE)
+  linked_cid <- DremelExecuteQuery("SELECT n_cid FROM n_of_linked_cids;", myConn)
+  linked_cid <- round(linked_cid\$n_cid,1)
+
+  # Merging.
+  f <- merge(c, d, all=TRUE)
+  f\$country <- factor(f\$country)
+  f\$vertical <- factor(f\$vertical)
+  f <- ddply(f, .(), transform, percentile = round(ecdf(daily_before)(daily_before),1))
+  f <- ddply(f, .(), transform, dyn_percentile = round(ecdf(dynamic)(dynamic),1))
+
+  # Bernoulli:
+  # Estimate propensity score with Generalized Boosted Model.
+  # Package GBM uses interaction.depth parameter as a number of splits it
+  # has to perform on a tree.
+  # 3,000 to 10,000 iterations with shrinkage rates between 0.01 and 0.001.
+  # "bernoulli" (logistic regression for 0-1 outcomes),
+  # "adaboost" (the AdaBoost exponential loss for 0-1 outcomes).
+  sink("/tmp/models_output_${service_channel}_${date}.txt")
+  gps <- gbm(treat ~ country + vertical + percentile + dyn_percentile, data = f,
+    n.trees=500, train.fraction=0.5, interaction.depth=4,
+    distribution="bernoulli", shrinkage=0.001)
+  # If type="response" then gbm converts back to the same scale as the outcome.
+  f\$gpsvalue <- predict(gps, type="response", n.trees=500)
+  f\$weight <- ifelse(f\$treat == 1, 1/f\$gpsvalue, 1/(1-f\$gpsvalue))
+  wlm <- lm(diff ~ treat, data = f, weights= (f\$weight))
+
+  names <- c("bernoulli_mean", "p-value", "CILow", "CIup", "uplif%", "ARR")
+  data <- c(
+    round(summary(wlm)\$coefficients[2],2),
+    round(summary(wlm)\$coefficients[8],2),
+    round(summary(wlm)\$coefficients[2] - summary(wlm)\$coefficients[4]*2,2),
+    round(summary(wlm)\$coefficients[2] + summary(wlm)\$coefficients[4]*2,2),
+    round((summary(wlm)\$coefficients[2]/mean_before)*100,2),
+    round(summary(wlm)\$coefficients[2]*365*linked_cid,2)
+    )
+   data.frame(names,data)
+
+  # AdaBoost.
+  agps <- gbm(treat ~ country + vertical + percentile + dyn_percentile, data = f,
+    n.trees=500, train.fraction=0.5, interaction.depth=4,
+    distribution="adaboost", shrinkage=0.001)
+  # If type="response" then gbm converts back to the same scale as the outcome.
+  f\$agpsvalue <- predict(agps, type="response", n.trees=500)
+  f\$aweight <- ifelse(f\$treat == 1, 1/f\$agpsvalue, 1/(1-f\$agpsvalue))
+  awlm <- lm(diff ~ treat, data = f, weights= (f\$aweight))
+
+  anames <- c("adaboost_mean", "adaboost_p-value", "adaboost_CILow", "adaboost_CIup",
+    "adaboost_uplif%", "adaboost_ARR")
+  adata <- c(
+    round(summary(awlm)\$coefficients[2],2),
+    round(summary(awlm)\$coefficients[8],2),
+    round(summary(awlm)\$coefficients[2] - summary(awlm)\$coefficients[4]*2,2),
+    round(summary(awlm)\$coefficients[2] + summary(awlm)\$coefficients[4]*2,2),
+    round((summary(awlm)\$coefficients[2]/mean_before)*100,2),
+    round(summary(awlm)\$coefficients[2]*365*linked_cid,2)
+    )
+  data.frame(anames,adata)
+  sink()
+
+EOF
+
+  echo ''| sendgmr --subject="Imputed ${channel} ${date}" \
+  --attachment_files="/tmp/models_output_${service_channel}_${date}.txt" --to=aredakov
+
+  cat "/tmp/models_output_${service_channel}_${date}.txt"
+  local value=$(cat "/tmp/models_output_${service_channel}_${date}.txt"|cell bernoulli_mean 3)
+  local min=$(cat "/tmp/models_output_${service_channel}_${date}.txt"|cell ' CILow ' 3)
+  local max=$(cat "/tmp/models_output_${service_channel}_${date}.txt"|cell ' CIup ' 3)
+
+  upload_metric --type KPI --min "${min}" --max "${max}" --value="${value}" --date "${date}" \
+  Totals Imputed_revenue_"${service_channel}"
+
+  upload_metric --date "${date}" --value="$(cat "/tmp/models_output_${service_channel}_${date}.txt"|cell ' uplif% ' 3)" \
+  --type KPI Totals Imputed_percentage_"${service_channel}"
+
+  upload_metric --date "${date}" --value="$(cat "/tmp/models_output_${service_channel}_${date}.txt"|cell ' ARR ' 3)" \
+  --type KPI Totals ARR_"${service_channel}"
+}
+
+  for service_channel in LCS SBS; do
+       imputed_revenue "${1}" "${service_channel}"
+  done
